@@ -1,259 +1,796 @@
 ---
 # rename_vm.yml
 #
-# Rename a KubeVirt VirtualMachine on OpenShift while keeping its PVC / data disk intact.
+# Rename a KubeVirt VirtualMachine by CLONING its disks, verifying the
+# replacement, and only then deleting the original ("clone-then-swap").
 #
-# This is the tested procedure from README.md, scripted. It also handles the
-# MTv/forklift "stuck Terminating PVC" case by re-attaching the PVC to the renamed VM.
+# This is THE rename workflow. It replaces the earlier delete+recreate
+# approach (removed in this revision), whose live-cluster QE testing found
+# critical defects; the clone design eliminates them structurally rather
+# than by patching:
+#
+#   * DataVolume-backed disks died with the old VM anyway: null-patching a
+#     dataVolumeTemplates DV's ownerReferences races virt-controller
+#     reconciliation, which re-adds them while the VM exists.
+#     Here the old VM and its DVs are never touched until the replacement
+#     is verified, so the race cannot matter.
+#   * Persistent TPM/EFI state was lost: the `persistent-state-for-<vm>` PVC
+#     is created by virt-controller and does NOT appear in the VM spec, so
+#     volume discovery never saw it. Here it is discovered by its
+#     `persistent-state-for` label and cloned like any other disk; the
+#     controller adopts the labeled clone instead of creating a blank one.
+#   * Hotplugged volumes (attached to the running VMI, absent from the VM
+#     spec) are runtime-only state that KubeVirt drops when the VM stops,
+#     so a rename silently lost them. Here they are detected by diffing
+#     the VMI's attached volumes (PVC- AND DataVolume-typed) against the
+#     VM spec, cloned like any other disk, and re-attached with
+#     `virtctl addvolume` after the renamed VM is Running. The re-attach
+#     adapts to the local virtctl: virtctl >= 1.10 accepts --disk-name,
+#     which keeps the original volume name (and from 1.9 the volume is
+#     always persisted into the VM spec — --persist is a deprecated no-op
+#     there); older virtctl has no --disk-name, so the volume is named
+#     after the clone PVC and stays runtime-only.
+#   * A PVC-binding assertion raced after the old VM was already deleted,
+#     leaving the VM unapplied and PVs stranded on Retain.
+#     Here a clone that does not complete simply aborts the run: the clones
+#     are removed and the original VM is restarted, fully intact.
+#
+# Workflow:
+#   0. pre-flight: argument/DNS-1123/collision guards, manifest backup,
+#      disk discovery (PVC + DataVolume volumes AND the hidden state PVC),
+#      planned clone-name collision checks
+#   1. stop the source VM (fails hard if the VMI never goes away)
+#   2. clone every data disk with a CDI DataVolume (source.pvc — CSI clone
+#      on capable storage, host-assisted copy on NFS) plus the 10Mi
+#      persistent-state PVC; wait for Succeeded, failing hard. On timeout:
+#      remove the clones and restart the original VM.
+#   3. transform the manifest (rename, flatten DV/PVC references to the
+#      cloned PVCs, strip server fields) and validate it server-side
+#   4. apply, start, wait for the VMI to be Running (FAILS HARD), verify
+#      the volume mapping, and re-attach any hotplugged volumes
+#   5. ONLY THEN delete the source VM and its now-obsolete original data
+#      disks (the state PVC and templated DataVolumes are garbage-collected
+#      with the VM; plain PVCs and user-created DataVolumes are released
+#      explicitly, since each DataVolume owns its PVC). The swap only runs
+#      when boot verification ran (start_after resolved to true): a VM
+#      that was deliberately not started keeps its original intact unless
+#      -e swap_unverified=true forces the swap. keep_old=true always
+#      skips this step to leave a rollback window.
+#
+# Costs vs delete+recreate: every disk is fully copied (transient double
+# storage; on NFS-CSI that is a full host-assisted network copy, plus CDI
+# scratch space), and the VM is down for the whole copy window.
+#
+# NOTE on KubeVirt's own VM-clone API: `virtctl clone` (the
+# VirtualMachineClone CRD) REFUSES source VMs with persistent TPM/EFI —
+# "Clone of source with backendstorage is not supported"
+# (pkg/virt-controller/watch/clone/clone.go) — because its snapshot/restore
+# cannot remap the name-derived state PVC to the target VM. This playbook
+# does NOT use that API. It clones individual PVCs with CDI DataVolumes
+# (source.pvc), which have no backend-storage restriction, and explicitly
+# clones + relabels the state PVC for the new VM name — the remapping step
+# the VM-clone API lacks.
 #
 # Usage:
 #   ansible-playbook rename_vm.yml \
 #     -e vm_name=vader.syangsao.net -e new_name=vader -e vm_namespace=virt-linux \
-#     [-e start_after=true] [-e dry_run=false]
+#     [-e start_after=auto|true|false] [-e dry_run=false] [-e keep_old=false]
+#     [-e swap_unverified=false]
 #
-# Requirements:
-#   * `oc` (or `kubectl`) and `virtctl` on PATH, authenticated to the target cluster.
-#   * Python 3 + PyYAML on the controller host (used for the manifest transform).
+# Wait tuning (defaults in vars below): clone_wait_retries x clone_wait_delay
+# bounds each clone (120 x 10s = 20 minutes), vmi_wait_* bounds VM startup,
+# vm_gone_* bounds deletion of the old VM object.
 #
-# The playbook is designed to be run ONCE per rename: it stops the VM, rewrites the
-# manifest under a fixed filename, deletes the old VM, and applies the new one.
-# Re-running against an already-renamed cluster will fail the "read current VM" step
-# (expected — the source name no longer exists).
+# There is deliberately NO recovery-from-backup mode: nothing is destroyed
+# before the verification gate, so a failed run is simply re-run. If a run
+# fails after the renamed VM was applied, the original is still intact;
+# delete the new VM and its clone DataVolumes to roll back, or fix the
+# startup problem and re-run.
 
-- name: Rename a KubeVirt VM keeping its data disk
+- name: Rename a KubeVirt VM by cloning its disks, then swapping
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
-    vm_name: vader.syangsao.net        # current VirtualMachine name
-    new_name: vader                    # desired name (metadata.name cannot change in place)
-    vm_namespace: virt-linux              # vm_namespace the VM lives in
-    start_after: true                  # power the renamed VM back on at the end
-    dry_run: false                     # if true: stop + patch PV only; do NOT delete/apply
-    workdir: "{{ playbook_dir }}"      # where manifests are written
+    # No defaults for vm_name / new_name / vm_namespace — pass them with -e.
+    start_after: auto        # auto = start the renamed VM iff it was running before
+    dry_run: false           # true = read-only: plan and validate, mutate nothing
+    keep_old: false          # true = keep the original VM + disks after the swap
+    swap_unverified: false   # true = swap even when boot verification was
+                             #        skipped (VM not started) - opt-in risk
+    workdir: "{{ playbook_dir }}"
+    clone_wait_retries: 120
+    clone_wait_delay: 10
+    vmi_wait_retries: 60
+    vmi_wait_delay: 10
+    vm_gone_retries: 60
+    vm_gone_delay: 5
 
   tasks:
     # -------------------------------------------------------------------------
-    # 0. Discovery — resolve volume -> PVC -> PV from the live VM
+    # 0. Pre-flight checks — fail before touching anything
     # -------------------------------------------------------------------------
-    - name: Read the current VM manifest (falls back to backup if already deleted)
+    - name: Require explicit vm_name, new_name and vm_namespace
+      assert:
+        that:
+          - vm_name is defined and vm_name | length > 0
+          - new_name is defined and new_name | length > 0
+          - vm_namespace is defined and vm_namespace | length > 0
+        fail_msg: "vm_name, new_name and vm_namespace must be passed with -e"
+
+    - name: Refuse a no-op rename
+      assert:
+        that: vm_name != new_name
+        fail_msg: "new_name ({{ new_name }}) must differ from vm_name"
+
+    - name: Validate new_name as a DNS-1123 subdomain
+      assert:
+        that: new_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')
+        fail_msg: >-
+          new_name '{{ new_name }}' is not a valid DNS-1123 subdomain
+          (lowercase alphanumerics, '-' and '.').
+
+    - name: Read the current VM manifest (the source VM must exist)
       command: oc get vm {{ vm_name }} -n {{ vm_namespace }} -o yaml
       register: vm_yaml_raw
+      changed_when: false
+
+    - name: Check whether new_name is already taken
+      command: oc get vm {{ new_name }} -n {{ vm_namespace }} -o name
+      register: new_vm_check
       failed_when: false
+      changed_when: false
 
-    - name: Use backup file if the VM is already gone (re-run after partial failure)
-      set_fact:
-        vm_yaml_raw: "{{ vm_yaml_raw | combine({'stdout': lookup('file', workdir ~ '/' ~ vm_name ~ '_' ~ vm_namespace ~ '.yaml.bkp')}) }}"
-      when: vm_yaml_raw.rc != 0
+    - name: Refuse to overwrite an existing VM named new_name
+      assert:
+        that: new_vm_check.rc != 0
+        fail_msg: >-
+          A VirtualMachine named '{{ new_name }}' already exists in namespace
+          {{ vm_namespace }}. Refusing to rename {{ vm_name }}.
 
+    # Written only outside dry-run mode: dry_run must not touch the
+    # filesystem at all (QE round-2 #6).
     - name: Save pristine backup of the VM manifest
       copy:
         content: "{{ vm_yaml_raw.stdout }}"
         dest: "{{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml.bkp"
-        mode: "0644"
+        mode: "0600"
+      when: not dry_run | bool
 
-    - name: Resolve each volume to its PVC, PV, access modes, and requested size
+    # -------------------------------------------------------------------------
+    # 1. Discovery — every disk the rename must carry across, including the
+    #    persistent TPM/EFI state PVC that is NOT in the VM spec
+    # -------------------------------------------------------------------------
+    - name: Resolve each PVC-backed volume to its PVC and settings
       set_fact:
         disk_map: >-
           {{ disk_map | default([]) + [ {
                'volume': v.name,
                'pvc': v.persistentVolumeClaim.claimName,
-               'pv':  (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~
-                              ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.volumeName}')).strip(),
-               'accessModes': (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~
-                                      ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.accessModes[0]}')).strip(),
-               'storage': (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~
-                                  ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.resources.requests.storage}')).strip()
-             } ] }}
+               'accessModes': ((lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.accessModes}')).strip() | regex_replace('^\[|\]$', '') | regex_replace('"', '')).split(),
+               'volumeMode': (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.volumeMode}')).strip(),
+               'storage': (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.resources.requests.storage}')).strip(),
+               'storageClassName': (lookup('pipe', 'oc get pvc ' ~ v.persistentVolumeClaim.claimName ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.storageClassName}')).strip(),
+               'dv': '',
+               'clone': new_name ~ '-' ~ v.name } ] }}
       loop: "{{ (vm_yaml_raw.stdout | from_yaml).spec.template.spec.volumes }}"
       loop_control:
         loop_var: v
       when: v.persistentVolumeClaim is defined and v.persistentVolumeClaim.claimName is defined
 
-    - name: Assert we found at least one disk to protect
-      assert:
-        that: disk_map | length > 0
-        fail_msg: "VM {{ vm_name }} has no PVC-backed volumes."
+    - name: Resolve each DataVolume-backed volume to its underlying PVC and settings
+      vars:
+        dv_claim: >-
+          {{ (lookup('pipe', 'oc get dv ' ~ v.dataVolume.name ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.status.claimName}')).strip() or v.dataVolume.name }}
+      set_fact:
+        disk_map: >-
+          {{ disk_map | default([]) + [ {
+               'volume': v.name,
+               'pvc': dv_claim,
+               'accessModes': ((lookup('pipe', 'oc get pvc ' ~ dv_claim ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.accessModes}')).strip() | regex_replace('^\[|\]$', '') | regex_replace('"', '')).split(),
+               'volumeMode': (lookup('pipe', 'oc get pvc ' ~ dv_claim ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.volumeMode}')).strip(),
+               'storage': (lookup('pipe', 'oc get pvc ' ~ dv_claim ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.resources.requests.storage}')).strip(),
+               'storageClassName': (lookup('pipe', 'oc get pvc ' ~ dv_claim ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.storageClassName}')).strip(),
+               'dv': v.dataVolume.name,
+               'clone': new_name ~ '-' ~ v.name } ] }}
+      loop: "{{ (vm_yaml_raw.stdout | from_yaml).spec.template.spec.volumes }}"
+      loop_control:
+        loop_var: v
+      when: v.dataVolume is defined and v.dataVolume.name is defined
 
-    - name: Show the disks we will protect
+    - name: Show the disks that will be cloned
       debug:
-        msg: "{{ disk_map }}"
+        msg: "{{ disk_map | default([]) }}"
 
-    # -------------------------------------------------------------------------
-    # 1. Stop the VM (must be fully off before re-attach)
-    # -------------------------------------------------------------------------
-    - name: Stop the VM
-      command: virtctl stop {{ vm_name }} -n {{ vm_namespace }}
-      register: stop_vm
+    - name: Detect whether the VM is currently running
+      command: oc get vmi {{ vm_name }} -n {{ vm_namespace }} -o name
+      register: vmi_exists
       failed_when: false
-      changed_when: "'scheduled to stop' in stop_vm.stdout"
+      changed_when: false
 
-    - name: Wait for the VMI to be gone
-      command: oc get vmi {{ vm_name }} -n {{ vm_namespace }} -o jsonpath='{.status.phase}'
-      register: vmi_phase
+    - name: Record whether the VM was running
+      set_fact:
+        vm_was_running: "{{ vmi_exists.rc == 0 }}"
+
+    # The persistent TPM/EFI backend PVC is created by virt-controller and
+    # never appears in the VM spec. kubevirt looks it up by the
+    # `persistent-state-for` label first, legacy `persistent-state-for-<vm>`
+    # name second (pkg/storage/backend-storage) — so we do both.
+    - name: Look for a persistent TPM/EFI state PVC by label
+      command: >-
+        oc get pvc -l persistent-state-for={{ vm_name }} -n {{ vm_namespace }}
+        -o jsonpath={.items[*].metadata.name}
+      register: state_pvc_label
       failed_when: false
-      until: vmi_phase.rc != 0            # NotFound => VMI cleaned up
-      retries: 30
-      delay: 5
+      changed_when: false
 
-    # -------------------------------------------------------------------------
-    # 2. Protect every bound PV (reclaim policy -> Retain). MANDATORY.
-    # -------------------------------------------------------------------------
-    - name: Patch each PV reclaim policy to Retain
-      command: |
-        oc patch pv {{ item.pv }} \
-          -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
-      loop: "{{ disk_map }}"
+    - name: Fall back to the legacy state PVC name
+      command: oc get pvc persistent-state-for-{{ vm_name }} -n {{ vm_namespace }} -o name
+      register: state_pvc_legacy
+      failed_when: false
+      changed_when: false
+      when: (state_pvc_label.stdout | default('')) | length == 0
 
-    - name: Verify every PV is now Retain
-      command: oc get pv {{ item.pv }} -o jsonpath='{.spec.persistentVolumeReclaimPolicy}'
-      register: pv_policy
-      loop: "{{ disk_map }}"
+    - name: Record the state PVC name (label lookup)
+      set_fact:
+        state_pvc: "{{ (state_pvc_label.stdout | default('')) | split | first }}"
+      when: (state_pvc_label.stdout | default('')) | length > 0
+
+    - name: Record the state PVC name (legacy fallback)
+      set_fact:
+        state_pvc: "persistent-state-for-{{ vm_name }}"
+      when:
+        - (state_pvc_label.stdout | default('')) | length == 0
+        - (state_pvc_legacy.rc | default(1)) == 0
+
+    - name: Record that the VM has no persistent state PVC
+      set_fact:
+        state_pvc: ""
+      when: state_pvc is not defined
+
+    - name: Show the persistent-state PVC (empty = none)
+      debug:
+        msg: "state PVC: '{{ state_pvc }}'"
+
+    - name: Warn when the VM wants persistent TPM/EFI state but has no state PVC yet
+      vars:
+        wants_state: "{{ 'persistent: true' in (vm_yaml_raw.stdout | default('')) }}"
+      debug:
+        msg: >-
+          NOTE: this VM is configured for persistent TPM/EFI state, but no
+          state PVC exists yet (the VM has probably never been started).
+          The renamed VM will get a fresh blank state PVC — nothing existing
+          is lost, but if you expected TPM secrets to be present, stop and
+          investigate before renaming.
+      when:
+        - state_pvc == ''
+        - wants_state | bool
+
+    - name: Capture the state PVC settings
+      set_fact:
+        state_settings: >-
+          {{ { 'accessModes': ((lookup('pipe', 'oc get pvc ' ~ state_pvc ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.accessModes}')).strip() | regex_replace('^\[|\]$', '') | regex_replace('"', '')).split(),
+               'volumeMode': (lookup('pipe', 'oc get pvc ' ~ state_pvc ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.volumeMode}')).strip(),
+               'storage': (lookup('pipe', 'oc get pvc ' ~ state_pvc ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.resources.requests.storage}')).strip(),
+               'storageClassName': (lookup('pipe', 'oc get pvc ' ~ state_pvc ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.storageClassName}')).strip() } }}
+      when: state_pvc != ''
+
+    - name: Set the state clone name
+      set_fact:
+        state_clone_name: "persistent-state-for-{{ new_name }}"
+
+    # Volumes attached to the running VMI but absent from the VM spec are
+    # hotplugged (or were added by another operator). KubeVirt keeps these
+    # as runtime-only state — they are DROPPED when the VM stops, so a rename
+    # that ignores them silently loses the disks (the long-standing
+    # "hotplug volumes don't survive a restart" behavior). We carry them the
+    # same way as the TPM/EFI state PVC: clone while the VM is stopped and
+    # quiesced, then re-attach once the renamed VM is Running. The state PVC
+    # itself is excluded — some kubevirt versions surface it in the VMI
+    # volume list, and it is already carried by the labeled clone above.
+    #
+    # A hotplugged volume is PVC-typed OR DataVolume-typed in the VMI
+    # (virtctl addvolume resolves --volume-name as a DataVolume first), so
+    # BOTH fields are read; exactly one of them is non-empty per volume.
+    - name: List the volumes attached to the running VMI
+      command: >-
+        oc get vmi {{ vm_name }} -n {{ vm_namespace }}
+        -o 'jsonpath={range .spec.volumes[*]}{.name}={.persistentVolumeClaim.claimName}{.dataVolume.name}{"\n"}{end}'
+      register: vmi_vol_pairs
+      changed_when: false
+      when: vm_was_running | bool
+
+    - name: Record each hotplugged volume (in the VMI, absent from the VM spec)
+      vars:
+        # covered = every volume the manifest already carries: its PVCs AND
+        # its DataVolume names (the VMI may surface a spec volume under
+        # either form, so both must count as covered)
+        covered: "{{ (disk_map | default([]) | map(attribute='pvc') | list)
+                     + (disk_map | default([]) | selectattr('dv', 'ne', '')
+                        | map(attribute='dv') | list)
+                     + ([state_pvc] if state_pvc != '' else []) }}"
+      set_fact:
+        hotplug_map: >-
+          {{ hotplug_map | default([]) + [ {
+               'volume': hp.split('=')[0],
+               'src': hp.split('=')[1],
+               'clone': new_name ~ '-hotplug-' ~ hp.split('=')[0] } ] }}
+      loop: "{{ vmi_vol_pairs.stdout_lines | default([]) | select('match', '^[^=]+=[^=]+$') | list }}"
       loop_control:
-        label: "{{ item.pv }}"
+        loop_var: hp
+      when:
+        - vm_was_running | bool
+        - hp.split('=')[1] not in covered
 
-    - name: Assert all PVs are Retain
+    # A hotplug source may be a DataVolume name rather than a PVC name —
+    # resolve it to the underlying PVC so the settings lookup and the CDI
+    # clone source point at a real PVC. Sources that are not DataVolumes
+    # fail the get (rc != 0) and are their own PVC.
+    - name: Resolve DataVolume-typed hotplug sources to their PVCs
+      command: oc get dv {{ item.src }} -n {{ vm_namespace }} -o jsonpath={.status.claimName}
+      register: hp_dv_claim
+      failed_when: false
+      changed_when: false
+      loop: "{{ hotplug_map | default([]) }}"
+
+    - name: Build the hotplug source-to-PVC map
+      set_fact:
+        hp_pvc_map: >-
+          {{ hp_pvc_map | default({}) | combine({
+               item.item.src: {
+                 'pvc': ((item.stdout | trim)
+                         if (item.rc | default(1)) == 0 and (item.stdout | trim | length > 0)
+                         else item.item.src),
+                 'dv': (item.item.src if (item.rc | default(1)) == 0 else '') } }) }}
+      loop: "{{ hp_dv_claim.results | default([]) }}"
+
+    - name: Capture the settings of each hotplugged PVC
+      vars:
+        hp_resolved: "{{ (hp_pvc_map | default({}))[hp.src]
+                         | default({'pvc': hp.src, 'dv': ''}) }}"
+        hp_pvc_name: "{{ hp_resolved.pvc }}"
+      set_fact:
+        disk_map: >-
+          {{ disk_map | default([]) + [ {
+               'volume': hp.volume,
+               'pvc': hp_pvc_name,
+               'accessModes': ((lookup('pipe', 'oc get pvc ' ~ hp_pvc_name ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.accessModes}')).strip() | regex_replace('^\[|\]$', '') | regex_replace('"', '')).split(),
+               'volumeMode': (lookup('pipe', 'oc get pvc ' ~ hp_pvc_name ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.volumeMode}')).strip(),
+               'storage': (lookup('pipe', 'oc get pvc ' ~ hp_pvc_name ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.resources.requests.storage}')).strip(),
+               'storageClassName': (lookup('pipe', 'oc get pvc ' ~ hp_pvc_name ~ ' -n ' ~ vm_namespace ~ ' -o jsonpath={.spec.storageClassName}')).strip(),
+               'dv': hp_resolved.dv,
+               'clone': hp.clone,
+               'hotplug': true } ] }}
+      loop: "{{ hotplug_map | default([]) }}"
+      loop_control:
+        loop_var: hp
+
+    - name: Show the hotplugged volumes that will be carried
+      debug:
+        msg: >-
+          Hotplugged volumes carried (clone + re-attach): {{ hotplug_map | default([]) }};
+          note that hotplug volumes can only be detected on a RUNNING VM.
+
+    - name: Assemble the list of clone names
+      set_fact:
+        clone_names: >-
+          {{ (disk_map | default([]) | map(attribute='clone') | list)
+             + ([state_clone_name] if state_pvc != '' else []) }}
+
+    - name: Check the planned clone PVC names are free
+      command: oc get pvc {{ item }} -n {{ vm_namespace }} -o name
+      register: clone_pvc_free
+      failed_when: false
+      changed_when: false
+      loop: "{{ clone_names }}"
+
+    - name: Refuse if a planned clone PVC name is taken
       assert:
-        that: "'Retain' in item.stdout"
-        fail_msg: "PV {{ item.item.pv }} is not Retain (got '{{ item.stdout }}')."
-      loop: "{{ pv_policy.results }}"
-      loop_control:
-        label: "{{ item.item.pv }}"
+        that: item.rc != 0
+        fail_msg: >-
+          A PVC named '{{ item.item }}' already exists in namespace
+          {{ vm_namespace }} — refusing to clone into it.
+      loop: "{{ clone_pvc_free.results }}"
+
+    - name: Check the planned clone DataVolume names are free
+      command: oc get dv {{ item }} -n {{ vm_namespace }} -o name
+      register: clone_dv_free
+      failed_when: false
+      changed_when: false
+      loop: "{{ clone_names }}"
+
+    - name: Refuse if a planned clone DataVolume name is taken
+      assert:
+        that: item.rc != 0
+        fail_msg: >-
+          A DataVolume named '{{ item.item }}' already exists in namespace
+          {{ vm_namespace }} — refusing to clone into it.
+      loop: "{{ clone_dv_free.results }}"
+
+    - name: Decide whether to start the renamed VM
+      set_fact:
+        start_the_vm: >-
+          {{ (start_after | bool) if (start_after | string) != 'auto'
+             else (vm_was_running | bool) }}
 
     # -------------------------------------------------------------------------
-    # 3. Transform the manifest: rename + strip server-managed fields
+    # 2. Dry run — plan only, stop before mutating anything
     # -------------------------------------------------------------------------
-    - name: Write the renamed manifest (new name, new app label, server fields stripped)
-      shell: |
-        NEW_NAME={{ new_name }} python3 {{ workdir }}/rename_transform.py \
-          < {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml.bkp \
-          > {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml
+    - name: Dry-run plan
+      debug:
+        msg: >-
+          DRY RUN: would stop {{ vm_name }}, clone {{ clone_names | length }}
+          PVC(s) {{ clone_names }}, apply the renamed VM '{{ new_name }}',
+          verify it Running{% if hotplug_map | default([]) | length > 0 %},
+          re-attach {{ hotplug_map | length }} hotplugged volume(s)
+          {{ hotplug_map | map(attribute='src') | list }}{% endif %}, then
+          delete the original. Nothing below runs.
+
+    - name: Stop here in dry-run mode
+      meta: end_host
+      when: dry_run | bool
+
+    # -------------------------------------------------------------------------
+    # 3. Stop the source VM — nothing has been mutated yet
+    # -------------------------------------------------------------------------
+    - name: Stop the source VM
+      command: virtctl stop {{ vm_name }} -n {{ vm_namespace }}
+      when: vm_was_running | bool
+
+    # QE #4 lesson: never rely on rc!=0 or failed_when with until. --ignore-not-found
+    # keeps every poll at rc 0, so the task can only fail by exhausting retries.
+    - name: Wait for the source VMI to be gone (graceful shutdown of Windows guests can take many minutes)
+      command: oc get vmi {{ vm_name }} -n {{ vm_namespace }} -o jsonpath='{.status.phase}' --ignore-not-found
+      register: vmi_phase
+      until: vmi_phase.stdout | trim | length == 0   # empty output => VMI cleaned up
+      retries: "{{ vmi_wait_retries | int }}"
+      delay: "{{ vmi_wait_delay | int }}"
+      when: vm_was_running | bool
+
+    # -------------------------------------------------------------------------
+    # 4. Clone phase — build the replacement disks. Nothing original is
+    #    destroyed, so any failure here is recoverable by re-running.
+    # -------------------------------------------------------------------------
+    - name: Build the clone DataVolume spec for each data disk
+      set_fact:
+        clone_items: >-
+          {{ clone_items | default([]) + [ {
+               'apiVersion': 'cdi.kubevirt.io/v1beta1',
+               'kind': 'DataVolume',
+               'metadata': { 'name': item.clone, 'namespace': vm_namespace },
+               'spec': {
+                 'source': { 'pvc': { 'name': item.pvc, 'namespace': vm_namespace } },
+                 'storage': ({ 'accessModes': item.accessModes,
+                               'resources': { 'requests': { 'storage': item.storage } } })
+                             | combine({ 'volumeMode': item.volumeMode } if item.volumeMode else {})
+                             | combine({ 'storageClassName': item.storageClassName } if item.storageClassName else {}) } } ] }}
+      loop: "{{ disk_map | default([]) }}"
+
+    - name: Add the persistent TPM/EFI state PVC to the clone set
+      set_fact:
+        clone_items: >-
+          {{ clone_items + [ {
+               'apiVersion': 'cdi.kubevirt.io/v1beta1',
+               'kind': 'DataVolume',
+               'metadata': { 'name': state_clone_name, 'namespace': vm_namespace },
+               'spec': {
+                 'source': { 'pvc': { 'name': state_pvc, 'namespace': vm_namespace } },
+                 'storage': ({ 'accessModes': state_settings.accessModes,
+                               'resources': { 'requests': { 'storage': state_settings.storage } } })
+                             | combine({ 'volumeMode': state_settings.volumeMode } if state_settings.volumeMode else {})
+                             | combine({ 'storageClassName': state_settings.storageClassName } if state_settings.storageClassName else {}) } } ] }}
+      when: state_pvc != ''
+
+    - name: Write the clone manifests
+      copy:
+        content: |
+          apiVersion: v1
+          kind: List
+          items: {{ clone_items | to_nice_json }}
+        dest: "{{ workdir }}/{{ new_name }}_{{ vm_namespace }}.clones.yaml"
+        mode: "0600"
+
+    - name: Clone the disks (create the DataVolumes)
+      when: true
+      block:
+        - name: Apply the clone DataVolumes
+          command: oc apply -f {{ workdir }}/{{ new_name }}_{{ vm_namespace }}.clones.yaml
+
+        - name: Wait for every clone DataVolume to complete
+          command: oc get dv {{ item }} -n {{ vm_namespace }} -o jsonpath={.status.phase} --ignore-not-found
+          register: dv_phase
+          until: "'Succeeded' in dv_phase.stdout"
+          retries: "{{ clone_wait_retries | int }}"
+          delay: "{{ clone_wait_delay | int }}"
+          loop: "{{ clone_names }}"
+          changed_when: false
+
+        - name: Label the cloned state PVC for adoption by the renamed VM
+          command: >-
+            oc label pvc {{ state_clone_name }} -n {{ vm_namespace }}
+            persistent-state-for={{ new_name }}
+          when: state_pvc != ''
+
+      rescue:
+        - name: Remove the clone DataVolumes created in this attempt
+          command: oc delete dv {{ item }} -n {{ vm_namespace }} --ignore-not-found
+          loop: "{{ clone_names }}"
+          failed_when: false
+
+        - name: Restart the original VM if it was running
+          command: virtctl start {{ vm_name }} -n {{ vm_namespace }}
+          when: vm_was_running | bool
+          failed_when: false
+
+        - name: Report the aborted clone phase
+          fail:
+            msg: >-
+              Cloning did not complete within
+              {{ (clone_wait_retries | int) * (clone_wait_delay | int) }} seconds
+              for {{ vm_name }} -> {{ new_name }}. The failed clones were
+              removed and the ORIGINAL VM {{ vm_name }} IS INTACT
+              ({{ 'restarted' if vm_was_running | bool else 'left stopped' }})
+              — no data was lost and nothing was renamed. Check the DataVolumes
+              (oc get dv -n {{ vm_namespace }}) and storage backend, then re-run.
+
+    # -------------------------------------------------------------------------
+    # 5. Transform + validate the renamed manifest
+    # -------------------------------------------------------------------------
+    - name: Build the source-PVC to clone-PVC map (plain PVC volumes)
+      set_fact:
+        pvc_map: >-
+          {{ dict((disk_map | default([]) | selectattr('dv', 'eq', '') | map(attribute='pvc')) | list
+                  | zip(disk_map | default([]) | selectattr('dv', 'eq', '') | map(attribute='clone') | list)) }}
+
+    - name: Build the DataVolume to clone-PVC map (DataVolume volumes)
+      set_fact:
+        dv_map: >-
+          {{ dict((disk_map | default([]) | selectattr('dv', 'ne', '') | map(attribute='dv')) | list
+                  | zip(disk_map | default([]) | selectattr('dv', 'ne', '') | map(attribute='clone') | list)) }}
+
+    - name: Write the renamed manifest (new name, labels, volumes remapped to clones, server fields stripped)
+      shell: >-
+        NEW_NAME='{{ new_name }}' PVC_MAP='{{ pvc_map | default({}) | to_json }}'
+        DV_MAP='{{ dv_map | default({}) | to_json }}'
+        python3 {{ workdir }}/rename_transform.py
+        < {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml.bkp
+        > {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml
       args:
         executable: /bin/bash
 
-    - name: Dry-run validate the renamed manifest
-      command: oc apply -f {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml --dry-run=client -n {{ vm_namespace }}
-      register: dry_apply
+    - name: Validate the renamed manifest against the API server (server-side dry run)
+      command: oc apply -f {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml --dry-run=server -n {{ vm_namespace }}
       changed_when: false
 
     # -------------------------------------------------------------------------
-    # 4. Delete the old VM (skipped in dry_run)
-    # -------------------------------------------------------------------------
-    - name: Delete the old VM
-      command: oc delete vm {{ vm_name }} -n {{ vm_namespace }}
-      when: not dry_run
-      register: del_vm
-      failed_when: false
-      changed_when: "'deleted' in del_vm.stdout"
-
-    # -------------------------------------------------------------------------
-    # 5. Recover a stuck Terminating PVC (MTv/forklift plan cleanup sets a deletionTimestamp)
-    # -------------------------------------------------------------------------
-    - name: Check each PVC for a deletionTimestamp after VM deletion
-      command: >-
-        oc get pvc {{ item.pvc }} -n {{ vm_namespace }} -o jsonpath={.metadata.deletionTimestamp}
-      register: pvc_delts
-      loop: "{{ disk_map }}"
-      when: not dry_run
-
-    - name: Identify PVCs stuck in Terminating (non-empty deletionTimestamp)
-      set_fact:
-        stuck_pvcs: >-
-          {{ disk_map
-             | zip(pvc_delts.results | default([]))
-             | selectattr('1', 'defined')
-             | selectattr('1.stdout', 'ne', '')
-             | map(attribute='0.pvc') | list }}
-      when: not dry_run
-
-    - name: For each stuck PVC — remove the pvc-protection finalizer so the object is removed
-      command: |
-        oc patch pvc {{ item }} -n {{ vm_namespace }} --type merge \
-          -p '{"metadata":{"finalizers":null}}'
-      loop: "{{ stuck_pvcs | default([]) }}"
-
-    - name: Wait for the terminating PVC objects to be removed
-      command: oc get pvc {{ item }} -n {{ vm_namespace }} -o jsonpath='{.metadata.uid}'
-      register: gone_check
-      loop: "{{ stuck_pvcs | default([]) }}"
-      failed_when: false
-      until: gone_check.rc != 0           # NotFound => gone
-      retries: 12
-      delay: 5
-
-    - name: Re-create each recovered PVC bound to the same PV
-      command: >-
-        oc apply -f -
-      args:
-        stdin: |
-          apiVersion: v1
-          kind: PersistentVolumeClaim
-          metadata:
-            name: {{ item.pvc }}
-            namespace: {{ vm_namespace }}
-          spec:
-            accessModes: ["{{ item.accessModes }}"]
-            volumeName: {{ item.pv }}
-            resources:
-              requests:
-                storage: {{ item.storage }}
-      loop: "{{ disk_map | selectattr('pvc', 'in', stuck_pvcs | default([])) }}"
-
-    - name: Manually re-bind each recovered PV to the new PVC (Released PVs do not auto-bind)
-      block:
-        - name: Get the new PVC uid
-          command: oc get pvc {{ item.pvc }} -n {{ vm_namespace }} -o jsonpath='{.metadata.uid}'
-          register: new_uid
-          loop: "{{ disk_map | selectattr('pvc', 'in', stuck_pvcs | default([])) }}"
-
-        - name: Set the uid for the current PVC
-          set_fact:
-            cur_uid: "{{ (new_uid.results | selectattr('item.pvc', 'equalto', item.pvc) | first).stdout }}"
-          loop: "{{ disk_map | selectattr('pvc', 'in', stuck_pvcs | default([])) }}"
-
-        - name: Patch PV claimRef to the new PVC
-          command: |
-            oc patch pv {{ item.pv }} --type merge \
-              -p '{"spec":{"claimRef":{"name":"{{ item.pvc }}","namespace":"{{ vm_namespace }}","uid":"{{ cur_uid }}"}}}'
-          loop: "{{ disk_map | selectattr('pvc', 'in', stuck_pvcs | default([])) }}"
-
-    # -------------------------------------------------------------------------
-    # 6. Apply the renamed VM manifest (skipped in dry_run)
+    # 6. Apply, start and VERIFY — the gate. The original VM is not deleted
+    #    until the replacement is proven good.
     # -------------------------------------------------------------------------
     - name: Apply the renamed VM manifest
       command: oc apply -f {{ workdir }}/{{ vm_name }}_{{ vm_namespace }}.yaml
-      when: not dry_run
-      register: apply_vm
-      changed_when: "'created' in apply_vm.stdout"
 
-    # -------------------------------------------------------------------------
-    # 7. Start the renamed VM and verify the disk re-attached
-    # -------------------------------------------------------------------------
     - name: Start the renamed VM
       command: virtctl start {{ new_name }} -n {{ vm_namespace }}
       register: start_vm
       failed_when: false
       changed_when: "'scheduled to start' in start_vm.stdout"
-      when: (start_after | bool) and not dry_run
+      when: start_the_vm | bool
 
-    - name: Wait for the renamed VMI to be Running
-      command: oc get vmi {{ new_name }} -n {{ vm_namespace }} -o jsonpath='{.status.phase}'
-      register: vmi_new
-      failed_when: false
-      until: "'Running' in vmi_new.stdout"
-      retries: 60
-      delay: 5
-      when: (start_after | bool) and not dry_run
+    - name: Verify the renamed VM actually starts
+      when: start_the_vm | bool
+      block:
+        - name: Wait for the renamed VMI to be Running (fails hard)
+          command: oc get vmi {{ new_name }} -n {{ vm_namespace }} -o jsonpath='{.status.phase}' --ignore-not-found
+          register: vmi_new
+          until: "'Running' in vmi_new.stdout"
+          retries: "{{ vmi_wait_retries | int }}"
+          delay: "{{ vmi_wait_delay | int }}"
+          changed_when: false
 
-    - name: Verify each volume still maps to its original PVC
+        # Hotplugged volumes were runtime-only state on the old VM. Restore
+        # them by re-attaching each clone. virtctl syntax varies by version
+        # (QE round-2 #2): every virtctl back to at least v1.4 takes exactly
+        # ONE positional argument (the VM) with a required --volume-name
+        # (the DataVolume/PVC source); virtctl >= 1.10 additionally accepts
+        # --disk-name, which sets the volume name in the spec — letting the
+        # renamed clone keep the ORIGINAL volume name. From virtctl 1.9 the
+        # volume is also always persisted to the VM spec (--persist is a
+        # deprecated no-op); on older virtctl it stays runtime-only and the
+        # volume is named after the clone PVC.
+        - name: Detect whether virtctl addvolume supports --disk-name
+          command: virtctl addvolume --help
+          register: addvolume_help
+          changed_when: false
+          failed_when: false
+
+        - name: Re-attach each hotplugged volume to the renamed VM
+          command: >-
+            virtctl addvolume {{ new_name }} -n {{ vm_namespace }}
+            --volume-name {{ item.clone }}
+            {{ '--disk-name ' ~ item.volume
+               if '--disk-name' in (addvolume_help.stdout | default(''))
+               else '' }}
+          loop: "{{ hotplug_map | default([]) }}"
+          when: hotplug_map | default([]) | length > 0
+
+        # One line per volume, claimName and dataVolume.name concatenated —
+        # exactly one of the two is set per volume. The per-line separator
+        # matters: a star-projection without {range} joins values with NO
+        # separator, which silently broke the assertion for 2+ volumes
+        # (QE round-2 #3).
+        - name: Read the volumes attached to the renamed VMI
+          command: >-
+            oc get vmi {{ new_name }} -n {{ vm_namespace }}
+            -o 'jsonpath={range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{.dataVolume.name}{"\n"}{end}'
+          register: new_vmi_pvcs
+          changed_when: false
+          when: hotplug_map | default([]) | length > 0
+
+        - name: Assert every hotplugged clone is attached (fails hard)
+          vars:
+            attached: "{{ (new_vmi_pvcs.stdout | default('')) | trim
+                          | split('\n') | map('trim') | select | list }}"
+            missing: "{{ hotplug_map | default([]) | rejectattr('clone', 'in', attached) | list }}"
+          assert:
+            that: missing | length == 0
+            fail_msg: >-
+              Hotplug clone PVC(s) {{ missing | map(attribute='clone') | list }}
+              were not attached to the new VMI (attached: {{ attached }}).
+          when: hotplug_map | default([]) | length > 0
+
+      rescue:
+        - name: Report the failed startup (the original VM was NOT deleted)
+          fail:
+            msg: >-
+              The renamed VM '{{ new_name }}' did not verify as healthy
+              (Running, or hotplug re-attach) within the wait window.
+              THE ORIGINAL VM {{ vm_name }} WAS NOT DELETED and is intact
+              (stopped). The new VM and its cloned disks were left in place
+              for investigation: oc get vmi {{ new_name }} -n {{ vm_namespace }},
+              oc get dv -n {{ vm_namespace }}. If a hotplug clone needs
+              manual attachment: virtctl addvolume {{ new_name }} -n
+              {{ vm_namespace }} --volume-name <clone-pvc> [--disk-name
+              <volume>]. To roll back entirely: oc delete vm {{ new_name }}
+              -n {{ vm_namespace }} and delete the clone DataVolumes, then
+              start {{ vm_name }} again.
+
+    # Read BOTH volume types: the flattened spec volumes are PVC-typed, but a
+    # re-attached hotplug clone is DataVolume-typed (addvolume resolves
+    # --volume-name as a DataVolume first, and every clone IS a DataVolume).
+    - name: Read the renamed VMI volume mapping
       command: |
         oc get vmi {{ new_name }} -n {{ vm_namespace }} \
-          -o 'jsonpath={range .spec.volumes[*]}{.name} {.persistentVolumeClaim.persistentVolumeClaimName}{"\n"}{end}'
+          -o 'jsonpath={range .spec.volumes[*]}{.name}={.persistentVolumeClaim.claimName}{.dataVolume.name}{"\n"}{end}'
       register: vmi_vols
-      when: (start_after | bool) and not dry_run
+      when: start_the_vm | bool
+      changed_when: false
 
-    - name: Show final VMI volume mapping
+    # Hotplug entries are excluded here: on older virtctl (no --disk-name)
+    # their volume is renamed to the clone PVC name, and their attachment is
+    # already asserted separately above.
+    - name: Assert each volume maps to its cloned PVC
+      assert:
+        that: (item.volume ~ '=' ~ item.clone) in vmi_vols.stdout_lines
+        fail_msg: >-
+          Volume {{ item.volume }} of the renamed VM does not map to its clone
+          PVC {{ item.clone }} (VMI reports: {{ vmi_vols.stdout_lines | default([]) }}).
+      loop: "{{ disk_map | default([]) | rejectattr('hotplug', 'defined') | list }}"
+      when: start_the_vm | bool
+
+    - name: Verify the cloned state PVC is labeled for the renamed VM
+      command: >-
+        oc get pvc {{ state_clone_name }} -n {{ vm_namespace }}
+        -o jsonpath={.metadata.labels.persistent-state-for}
+      register: state_label
+      changed_when: false
+      when: state_pvc != ''
+
+    - name: Assert the state PVC label points at the renamed VM
+      assert:
+        that: state_label.stdout == new_name
+        fail_msg: >-
+          The cloned state PVC is not labeled for '{{ new_name }}' — the
+          renamed VM would get a BLANK TPM/EFI state PVC.
+      when: state_pvc != ''
+
+    # -------------------------------------------------------------------------
+    # 7. Swap — the only destructive step, and only after verification.
+    #    When the renamed VM was never started, boot verification was
+    #    impossible, so the swap is refused (QE round-2 #1): the original is
+    #    kept intact unless swap_unverified=true explicitly accepts the risk.
+    # -------------------------------------------------------------------------
+    - name: Delete the original VM
+      command: oc delete vm {{ vm_name }} -n {{ vm_namespace }}
+      when:
+        - not keep_old | bool
+        - start_the_vm | bool or swap_unverified | bool
+
+    - name: Wait for the original VM object to be gone
+      command: oc get vm {{ vm_name }} -n {{ vm_namespace }} -o name --ignore-not-found
+      register: old_vm_gone
+      until: old_vm_gone.stdout | trim | length == 0
+      retries: "{{ vm_gone_retries | int }}"
+      delay: "{{ vm_gone_delay | int }}"
+      when:
+        - not keep_old | bool
+        - start_the_vm | bool or swap_unverified | bool
+
+    # Plain PVCs are not owned by the VM, so they survive its deletion and
+    # must be released explicitly (their data is fully copied by now).
+    # --wait=false: an MTV-stuck PVC must not hang the play.
+    # Hotplugged originals are only released once their clones were verified
+    # attached (which the gate above guarantees when the VM was started);
+    # if the VM was deliberately not started, both original and clone are
+    # kept so nothing can be lost.
+    - name: Release the original plain-PVC data disks
+      command: oc delete pvc {{ item.pvc }} -n {{ vm_namespace }} --wait=false
+      loop: "{{ disk_map | default([]) | selectattr('dv', 'eq', '') | list }}"
+      when:
+        - not keep_old | bool
+        - start_the_vm | bool or swap_unverified | bool
+        - not (item.hotplug | default(false)) or (start_the_vm | bool)
+
+    # DataVolume-backed disks: templated DVs are garbage-collected with the
+    # old VM, but user-created DVs (referenced via dataVolume volumes, not
+    # templates) survive it — each still owning its original PVC, a silent
+    # duplicate copy (QE round-2 #4). Deleting the DV cascades its PVC;
+    # --ignore-not-found covers DVs already collected with the VM.
+    - name: Release the original DataVolume-backed disks (each DV owns its PVC)
+      command: oc delete dv {{ item.dv }} -n {{ vm_namespace }} --ignore-not-found --wait=false
+      loop: "{{ disk_map | default([]) | selectattr('dv', 'ne', '') | list }}"
+      when:
+        - not keep_old | bool
+        - start_the_vm | bool or swap_unverified | bool
+        - not (item.hotplug | default(false)) or (start_the_vm | bool)
+
+    - name: Keep-old notice
       debug:
-        msg: "{{ vmi_vols.stdout_lines }}"
-      when: (start_after | bool) and not dry_run
+        msg: >-
+          keep_old=true: the original VM {{ vm_name }} and its disks were kept
+          (stopped) as a rollback window. Delete them manually once the rename
+          is confirmed: oc delete vm {{ vm_name }} -n {{ vm_namespace }}, plus
+          its original PVCs and DataVolumes.
+      when: keep_old | bool
+
+    - name: Unverified-swap notice (renamed VM was not started)
+      debug:
+        msg: >-
+          The renamed VM '{{ new_name }}' was NOT started (the source VM was
+          stopped / start_after=false), so boot verification could not run and
+          the swap was REFUSED: the original VM {{ vm_name }} and its disks
+          are intact (stopped). Finish manually: virtctl start {{ new_name }}
+          -n {{ vm_namespace }}, confirm it is Running and healthy, then
+          oc delete vm {{ vm_name }} -n {{ vm_namespace }} and release the
+          original PVCs/DataVolumes. To accept an unverified swap, re-run
+          with -e swap_unverified=true.
+      when:
+        - not keep_old | bool
+        - not (start_the_vm | bool)
+        - not (swap_unverified | bool)
+
+    # -------------------------------------------------------------------------
+    # 8. Summary — report observed state, not intentions
+    # -------------------------------------------------------------------------
+    - name: Read the final VMI state
+      command: oc get vmi {{ new_name }} -n {{ vm_namespace }} -o jsonpath='{.status.phase}'
+      register: final_phase
+      failed_when: false
+      changed_when: false
+
+    - name: Summary
+      debug:
+        msg: >-
+          Renamed {{ vm_name }} -> {{ new_name }} in namespace
+          {{ vm_namespace }} via disk clones {{ clone_names }}; VM started:
+          {{ final_phase.stdout == 'Running' }}; original VM deleted:
+          {{ not keep_old | bool and (start_the_vm | bool or swap_unverified | bool) }};
+          persistent TPM/EFI state carried:
+          {{ state_pvc != '' }}; hotplugged volumes carried:
+          {{ hotplug_map | default([]) | length }}
+          {% if hotplug_map | default([]) | length > 0 and not (start_the_vm | bool) %}
+          (clones created but NOT attached — VM was not started; the original
+          hotplug PVCs were kept; attach with virtctl addvolume when needed)
+          {% endif %}.
+          NOTE: the clone DataVolumes remain in the namespace and OWN the live
+          PVCs — deleting a clone DataVolume deletes its PVC and the VM's disk.

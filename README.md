@@ -1,531 +1,380 @@
-# Renaming a KubeVirt VirtualMachine on OpenShift (keeping the data disk)
+# Renaming a KubeVirt VirtualMachine on OpenShift (keeping all disks and state)
 
-This repo documents how to **rename** a KubeVirt `VirtualMachine` on an OpenShift cluster — e.g. from
-`vader.syangsao.net` to `vader` — **without losing the attached PVC / data disk**.
+This repo provides an Ansible playbook that **renames** a KubeVirt `VirtualMachine` on an
+OpenShift cluster — e.g. from `vader.syangsao.net` to `vader` — without losing any of its
+disks or state.
 
-Kubernetes objects do not allow `metadata.name` to be changed in place, so the rename is done by:
+Kubernetes objects do not allow `metadata.name` to be changed in place, so a rename must
+create a new VM object and carry the disks across. The playbook does this by
+**cloning every disk, verifying the replacement VM actually runs, and only then deleting
+the original** ("clone-then-swap"):
 
-1. stopping the VM,
-2. protecting the PV (reclaim policy → `Retain`),
-3. backing up and editing the VM manifest (new name + labels, server fields stripped),
-4. deleting the old VM,
-5. re-attaching the PVC to the renamed VM,
-6. applying the new VM manifest and verifying the disk is intact.
+1. pre-flight guards (required args, DNS-1123 name, target-name and clone-name
+   collisions), manifest backup, disk discovery;
+2. stop the source VM;
+3. clone every disk with a CDI DataVolume (`spec.source.pvc`) and wait for completion —
+   failing hard, and aborting with the original restarted and intact if a clone stalls;
+4. transform the manifest (rename, remap volumes to the cloned PVCs) and validate it
+   with a server-side dry run;
+5. apply, start and **verify** the renamed VM (VMI Running, volume mapping correct,
+   hotplug clones attached);
+6. only then delete the source VM and release the now-obsolete original disks (plain
+   PVCs and user-created DataVolumes). If the renamed VM was deliberately never started,
+   this step is refused — the original is kept until you verify the new VM by hand.
 
-The procedure below was **tested end-to-end** on the `luke` cluster
-(`api-luke-syangsao-net:6443`) renaming `vader.syangsao.net` → `vader` in namespace `virt-linux`.
+## Why clone-then-swap
+
+An earlier revision of this playbook renamed by delete-and-recreate: patch PVs to
+`Retain`, detach DataVolumes, delete the old VM, re-create/re-bind the PVCs, apply the
+renamed manifest. Live-cluster QE testing found critical defects in that approach, all
+of which trace back to a single structural requirement — *the original PVCs must survive
+the deletion of their own VM* — which several controllers violate:
+
+- **DataVolume-backed disks**: virt-controller re-owns templated DataVolumes while the
+  VM exists, so null-patching `ownerReferences` races reconciliation; the DVs (and their
+  PVCs) were garbage-collected with the old VM anyway, and recreated disks came back with
+  a flipped `volumeMode` so the VM could not start.
+- **Persistent TPM/EFI state**: the `persistent-state-for-<vm>` PVC is created by
+  virt-controller and does not appear in the VM spec, so it was destroyed with the old
+  VM and silently replaced with a blank one.
+- **MTv/forklift interference**: plan cleanup sets `deletionTimestamp` on PVCs when the
+  old VM goes away, forcing finalizer fights, PVC re-creation and manual `claimRef`
+  re-binds — each one a race that only matters because the PVC must outlive its VM.
+
+Cloning removes the requirement instead of fighting the controllers: every disk is fully
+copied **before** anything is destroyed, so MTv cleanup, DV cascades and finalizer timing
+at old-VM deletion are irrelevant. It also means the playbook performs **only
+namespaced operations** — no PV patching, no `claimRef` re-binds, no finalizer stripping —
+so namespace-level `edit` access is sufficient, and no cluster-scoped state can be left
+stranded.
+
+> **Note:** this playbook does **not** use `virtctl clone` (the VirtualMachineClone CRD).
+> That API refuses source VMs with persistent TPM/EFI state
+> ("Clone of source with backendstorage is not supported") because it cannot remap the
+> name-derived state PVC. Here each PVC is cloned individually with a CDI DataVolume,
+> which has no such restriction, and the state PVC is explicitly cloned and relabeled
+> for the new name.
+
+## What gets carried across
+
+| Disk class | How it is carried |
+|---|---|
+| Plain PVC volumes (`persistentVolumeClaim`) | CDI clone to `<new-name>-<volume>`, volume remapped in the manifest |
+| DataVolume volumes (`dataVolume` / `dataVolumeTemplates`) | underlying PVC cloned, volume flattened to a direct PVC reference, `dataVolumeTemplates` removed |
+| Persistent TPM/EFI state (`persistent-state-for-<vm>`, 10Mi, not in the VM spec) | discovered by label, cloned to `persistent-state-for-<new-name>` and labeled — virt-controller adopts it instead of creating a blank one |
+| Hotplugged volumes (attached to the running VMI, absent from the VM spec) | detected (PVC- **and** DataVolume-typed), cloned, and re-attached with `virtctl addvolume` after the renamed VM is Running. On virtctl ≥ 1.10, `--disk-name` keeps the original volume name; from virtctl 1.9 the volume is always persisted to the new VM's spec (`--persist` is a deprecated no-op); on older virtctl the volume is re-attached runtime-only and named after the clone PVC |
+
+Each clone copies the source PVC's `accessModes`, `volumeMode`, `storageClassName` and
+requested size verbatim, so a `Block` disk stays `Block` and the storage class never
+changes. Note that CDI provisions `Filesystem` clones ~6% larger than the request
+(1Gi → ~1.06Gi) for filesystem overhead; `Block` clones are exact.
 
 ---
 
-## Why this is necessary / what breaks if you skip a step
+## Step-by-step manual procedure
 
-A KubeVirt VM's root/data disk is a **PersistentVolumeClaim (PVC)**. The PVC is backed by a
-**PersistentVolume (PV)** whose storage class often has `reclaimPolicy: Delete` (e.g. NFS-CSI,
-PortWorx). If you delete the old VM *and* its PVC while the PV policy is `Delete`, the underlying
-data volume is **destroyed**. That is why step 2 (patching the PV to `Retain`) is mandatory before
-deleting anything.
+The playbook automates exactly the procedure below. Doing it by hand at least once is
+the best way to understand what the automation is doing — and what its failure
+postures protect you from. The running example renames `vader.syangsao.net` → `vader`
+in namespace `virt-linux`.
 
-Additionally, on a cluster where the VM was created by an **MTv / forklift migration plan**, deleting
-the VM can cause the plan's cleanup controller to set a `deletionTimestamp` on the PVC (it becomes
-stuck in `Terminating`). This repo documents how to recover from that too (see
-[Recovering a stuck Terminating PVC](#recovering-a-stuck-terminating-pvc)).
+> **Rule of order:** nothing original is deleted until **step 6**, after the renamed VM
+> is verified Running on its cloned disks. Every earlier step is recoverable by simply
+> walking away (delete any half-finished clone DataVolumes and start the VM again).
 
----
-
-## Prerequisites
-
-- `oc` (or `kubectl`) with admin access to the target cluster, and `virtctl` on `$PATH`.
-- The VM's storage class / PV reclaim policy known (check it — see step 1).
-- Enough time: the VM must be powered off for the whole operation.
-
-> **Note:** `oc virtctl …` is *not* a subcommand of `oc`; use the standalone `virtctl` binary instead.
-
----
-
-## Step-by-step procedure
-
-### 0. Identify the VM, its namespace, PVC and PV
+### 1. Identify the VM, its disks, and its hidden state
 
 ```bash
-# Find the VM across all namespaces
-oc get vms -A | grep <vm-name>
+NS=virt-linux; VM=vader.syangsao.net; NEW=vader
 
-# Example (our case): VM vader.syangsao.net in namespace virt-linux
-NS=virt-linux
-VM=vader.syangsao.net
-NEW_NAME=vader
+# PVC-backed volumes
+oc get vm $VM -n $NS -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}={.persistentVolumeClaim.claimName}{"\n"}{end}'
 
-# Which PVC does the VM's volume use?
-oc get vm $VM -n $NS -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}{"  -> "}{.persistentVolumeClaim.persistentVolumeClaimName}{"\n"}{end}'
+# DataVolume-backed volumes, and the PVC behind each DataVolume
+oc get vm $VM -n $NS -o jsonpath='{range .spec.template.spec.volumes[*]}{.name}={.dataVolume.name}{"\n"}{end}'
+oc get dv <dv-name> -n $NS -o jsonpath='{.status.claimName}{"\n"}'
+
+# Persistent TPM/EFI state PVC — created by virt-controller, NOT in the VM spec
+oc get pvc -n $NS -l persistent-state-for=$VM -o name
+# fallback if unlabeled (legacy naming): oc get pvc persistent-state-for-$VM -n $NS -o name
+
+# Hotplugged volumes — attached to the running VMI but absent from the lists above.
+# A hotplug is PVC-typed OR DataVolume-typed (virtctl addvolume resolves the source
+# as a DataVolume first), so read both fields; for a DataVolume-typed entry, resolve
+# the underlying PVC with: oc get dv <name> -o jsonpath={.status.claimName}
+oc get vmi $VM -n $NS -o jsonpath='{range .spec.volumes[*]}{.name}={.persistentVolumeClaim.claimName}{.dataVolume.name}{"\n"}{end}'
+
+# Capture each source PVC's settings — the clone must match them exactly
+oc get pvc <pvc-name> -n $NS -o jsonpath='{.spec.accessModes}{" "}{.spec.volumeMode}{" "}{.spec.storageClassName}{" "}{.spec.resources.requests.storage}{"\n"}'
 ```
 
-For our VM the output was:
+Write the full inventory down: volume name → source PVC → planned clone PVC
+(`<new-name>-<volume-name>` for spec volumes, `<new-name>-hotplug-<volume-name>` for
+hotplugged ones, `persistent-state-for-<new-name>` for the state PVC).
 
-```
-vol-0  type=          # (empty persistentVolumeClaim name in this jsonpath form)
-```
-
-so we read the claim directly:
-
-```bash
-oc get vm $VM -n $NS -o jsonpath='{.spec.template.spec.volumes[?(@.name=="vol-0")].persistentVolumeClaim.claimName}{"\n"}'
-# -> vader-rename-vm-10001-tmmt5
-```
-
-Then find the PV bound to that PVC:
-
-```bash
-oc get pv | grep <pvc-name>
-# pvc-3527684f-4517-49da-aa47-7ee2c7687dce   106Gi   RWX   Delete   Bound   virt-linux/vader-rename-vm-10001-tmmt5   nfs-csi
-```
-
-Key facts captured for our VM:
-
-| Item | Value |
-|------|-------|
-| VM | `vader.syangsao.net` in `virt-linux` |
-| New name | `vader` |
-| Volume → PVC | `vol-0` → `vader-rename-vm-10001-tmmt5` |
-| PV | `pvc-3527684f-4517-49da-aa47-7ee2c7687dce` |
-| Storage class | `nfs-csi` (reclaim policy **Delete**) |
-| PV capacity / mode | 106Gi, RWX |
-| PV source | NFS CSI: `nas01-80.syangsao.lab:/nfsshare/csidriver` |
-
----
-
-### 1. Stop the VM
+### 2. Stop the VM
 
 ```bash
 virtctl stop $VM -n $NS
-# VM vader.syangsao.net was scheduled to stop
+oc get vmi $VM -n $NS    # repeat until NotFound — Windows guests can take minutes
 ```
 
-Wait until the VMI is gone and the VM shows `Stopped`:
+Do **not** proceed while the VMI still exists — the clones must be taken from
+quiesced disks.
+
+### 3. Clone every disk
+
+For each PVC in the inventory, create a CDI DataVolume that clones it. The `storage`
+block must mirror the captured source settings:
 
 ```bash
-oc get vmi $VM -n $NS        # -> NotFound (VMI cleaned up)
-oc get vm  $VM -n $NS        # STATUS=Stopped
+oc apply -f - <<EOF
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ${NEW}-data              # the planned clone PVC name
+  namespace: $NS
+spec:
+  source:
+    pvc:
+      name: vader-rename-vm-10001-tmmt5   # the SOURCE PVC
+      namespace: $NS
+  storage:
+    accessModes: [ReadWriteMany]           # from the source PVC
+    volumeMode: Filesystem                 # from the source PVC — Block stays Block
+    storageClassName: nfs-csi              # from the source PVC
+    resources:
+      requests:
+        storage: 106Gi                     # same as the source request
+EOF
+
+oc get dv ${NEW}-data -n $NS -w    # wait until PHASE=Succeeded, then Ctrl-C
 ```
 
-> Do **not** proceed while the VM/VMI is still running — the PVC must be released before re-attach.
+Repeat for every disk, including hotplugged ones. On clone-capable storage (ODF/Ceph)
+this is near-instant; on NFS-CSI it is a host-assisted copy of the full disk and needs
+CDI scratch space — budget time and transient storage accordingly.
 
----
-
-### 2. Patch the PV reclaim policy to `Retain` (MANDATORY)
-
-Because the storage class (`nfs-csi`) uses `reclaimPolicy: Delete`, any deletion of the bound PVC
-would delete the data volume. Patch the **PV** (not the PVC) first:
+If the VM has persistent TPM/EFI state, clone the state PVC too, then relabel the clone
+so the renamed VM adopts it instead of getting a blank one:
 
 ```bash
-oc patch pv pvc-3527684f-4517-49da-aa47-7ee2c7687dce \
-  -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
-# persistentvolume/pvc-3527684f-... patched
-
+# ... clone persistent-state-for-$VM to persistent-state-for-$NEW as above ...
+oc label pvc persistent-state-for-${NEW} -n $NS persistent-state-for=${NEW}
 # verify
-oc get pv pvc-3527684f-4517-49da-aa47-7ee2c7687dce -o jsonpath='{.spec.persistentVolumeReclaimPolicy}{"\n"}'
-# Retain
+oc get pvc persistent-state-for-${NEW} -n $NS -o jsonpath='{.metadata.labels.persistent-state-for}{"\n"}'
+# -> vader
 ```
 
-If the VM has **multiple** data disks, patch **every** bound PV the same way.
-
----
-
-### 3. Back up the VM manifest (two files)
-
-Save one copy to edit and one pristine backup:
+### 4. Back up and transform the manifest
 
 ```bash
-oc get vm $VM -n $NS -o yaml > ${VM}_${NS}.yaml.bkp   # actual backup, do not touch
-cp ${VM}_${NS}.yaml.bkp ${VM}_${NS}.yaml              # working copy to modify
+oc get vm $VM -n $NS -o yaml > ${VM}_${NS}.yaml.bkp    # pristine backup, do not touch
 ```
 
----
+Either use the helper (recommended — it applies every edit below consistently):
 
-### 4. Edit the manifest
+```bash
+oc get vm $VM -n $NS -o yaml \
+  | NEW_NAME=$NEW \
+    PVC_MAP='{"vader-rename-vm-10001-tmmt5":"vader-data"}' \
+    DV_MAP='{"dv-root":"vader-rootdisk"}' \
+    python3 rename_transform.py > ${VM}_${NS}.yaml
+```
 
-In `${VM}_${NS}.yaml`, make these changes:
+…or edit a copy of the backup by hand:
 
 **Change:**
-- `metadata.name` → new name (`vader`)
-- `spec.template.metadata.labels.kubevirt.io/domain` → new name (if present)
-- `spec.template.metadata.labels.app` → new name (if present)
+- `metadata.name` → new name
+- `metadata.labels` and `spec.template.metadata.labels`: the `app`,
+  `kubevirt.io/vm` and `kubevirt.io/domain` labels → new name (both levels)
 
-**Remove** (server-managed fields that would break a re-apply):
-- `metadata.uid`
-- `metadata.resourceVersion`
-- `metadata.creationTimestamp`
-- `metadata.generation`
-- `metadata.managedFields`
-- `metadata.finalizers`
-- the entire `status:` block
-- `metadata.annotations` (kubemacpool timestamp, `kubevirt.io/latest-observed-api-version`,
-  `kubevirt.io/storage-observed-api-version`)
+**Remap the disks to the clones:**
+- `persistentVolumeClaim.claimName` → the clone PVC name (via `PVC_MAP` above)
+- `dataVolume: {name: …}` volumes → replace with
+  `persistentVolumeClaim: {claimName: <the DataVolume's PVC clone>}`
+- delete `spec.dataVolumeTemplates` entirely — re-applying it would create fresh
+  **blank** disks
 
-**Keep:**
-- `metadata.namespace`
-- `metadata.labels` (migration / plan labels etc.)
-- **DataVolume / PVC names stay the same** — they are separate resources and must not change.
+**Remove** (server-managed fields that break a re-apply):
+- `metadata.uid`, `resourceVersion`, `creationTimestamp`, `generation`,
+  `managedFields`, `finalizers`, the whole `status:` block
+- stale server annotations (`kubemacpool.io/transaction-timestamp`,
+  `kubevirt.io/latest-observed-api-version`, `kubevirt.io/storage-observed-api-version`)
 
-The edited manifest for our VM (`vader.syangsao.net_virt-linux.yaml`) is committed to this repo as a
-worked example. The essential diff:
-
-```diff
- metadata:
--  annotations:
--    kubemacpool.io/transaction-timestamp: "..."
--    kubevirt.io/latest-observed-api-version: v1
--    kubevirt.io/storage-observed-api-version: v1
-   labels:
-     ...
--  name: vader.syangsao.net
-+  name: vader
-   namespace: virt-linux
--  resourceVersion: "21232124"
--  uid: c7f445c1-...
- spec:
-   template:
-     metadata:
-       labels:
--        app: vader.syangsao.net
-+        app: vader
-```
-
-Validate before applying:
+Validate **before** applying:
 
 ```bash
-oc apply -f ${VM}_${NS}.yaml --dry-run=client -n $NS
-# virtualmachine.kubevirt.io/vader created (dry run)
+oc apply -f ${VM}_${NS}.yaml --dry-run=server -n $NS
 ```
 
----
-
-### 5. Delete the old VM
-
-```bash
-oc delete vm $VM -n $NS
-# virtualmachine.kubevirt.io "vader.syangsao.net" deleted
-```
-
-**Watch what happens to the PVC.** On a plain cluster the PVC simply stays `Bound`. But if the VM was
-created by an **MTv/forklift plan**, the plan cleanup can set a `deletionTimestamp` on the PVC and it
-goes to `Terminating`, stuck behind the `kubernetes.io/pvc-protection` finalizer:
-
-```bash
-oc get pvc <pvc-name> -n $NS
-# NAME                          STATUS        VOLUME   ...
-# vader-rename-vm-10001-tmmt5   Terminating   pvc-3527...   106Gi   RWX   nfs-csi
-
-oc get pvc <pvc-name> -n $NS -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadata.finalizers}{"\n"}'
-# 2026-10-27T16:59:46Z
-# ["kubernetes.io/pvc-protection"]
-
-oc get pv <pv-name> -o jsonpath='{.status.phase}{" "}{.spec.persistentVolumeReclaimPolicy}{"\n"}'
-# Bound Retain        # PV is safe; data intact on the backend
-```
-
-If you see this, jump to [Recovering a stuck Terminating PVC](#recovering-a-stuck-terminating-pvc)
-before applying the new VM. If the PVC simply stayed `Bound`, skip ahead to step 6.
-
----
-
-### 6. (Only if the PVC went Terminating) Re-attach the PVC to the renamed VM
-
-See the recovery section below. The short version:
-
-1. Remove the `pvc-protection` finalizer so the terminating PVC object is removed.
-2. Re-create the PVC with the **same name** and `spec.volumeName` pointing at the (now `Released`) PV.
-3. Manually re-bind by patching the PV's `spec.claimRef` to the new PVC's uid.
-
-After this, the PVC is `Bound` again to the same PV and the data disk is intact.
-
----
-
-### 7. Apply the new (renamed) VM manifest
+### 5. Apply, start, and verify the renamed VM
 
 ```bash
 oc apply -f ${VM}_${NS}.yaml
-# virtualmachine.kubevirt.io/vader created
+virtctl start $NEW -n $NS
+
+oc get vmi $NEW -n $NS -o jsonpath='{.status.phase}{"\n"}'    # must be Running
+# every volume must map to its CLONE, not the original PVC:
+oc get vmi $NEW -n $NS -o jsonpath='{range .spec.volumes[*]}{.name}={.persistentVolumeClaim.claimName}{"\n"}{end}'
 ```
 
-Because the backup was taken while the VM was `Halted`, the new VM starts in `Stopped`. Start it:
+Re-attach any hotplugged volumes. Every recent virtctl takes exactly ONE positional
+argument (the VM) plus a required `--volume-name` (the DataVolume/PVC source); newer
+virtctl additionally accepts `--disk-name` to keep the original volume name — and on
+that newer virtctl the volume is always persisted to the VM spec (`--persist` is a
+deprecated no-op):
 
 ```bash
-virtctl start vader -n $NS
-# VM vader was scheduled to start
+virtctl addvolume $NEW -n $NS --volume-name <clone-pvc>              # older virtctl
+virtctl addvolume $NEW -n $NS --volume-name <clone-pvc> --disk-name <volume-name>
 ```
 
----
-
-### 8. Verify the VMI started and the data disk is intact
+Then verify the attachment (both volume types, one per line):
 
 ```bash
-oc get vm  vader -n $NS     # STATUS=Running READY=True
-oc get vmi vader -n $NS     # PHASE=Running NODENAME=control01.syangsao.net READY=True
-
-# Confirm the volume maps to the same PVC
-oc get vmi vader -n $NS -o json | python3 -c "import sys,json;d=json.load(sys.stdin);[print(v['name'],'->',v.get('persistentVolumeClaim',{}).get('claimName')) for v in d['spec']['volumes']]"
-# vol-0 -> vader-rename-vm-10001-tmmt5
-
-# Confirm the PVC is bound to the same PV
-oc get pvc vader-rename-vm-10001-tmmt5 -n $NS
-# NAME                          STATUS   VOLUME                                     CAPACITY   ACCESS MODES
-# vader-rename-vm-10001-tmmt5   Bound    pvc-3527684f-...                           106Gi      RWX
-
-# Confirm the PV is still Retain + Bound
-oc get pv pvc-3527684f-... -o jsonpath='{.status.phase}{" "}{.spec.persistentVolumeReclaimPolicy}{"\n"}'
-# Bound Retain
-
-# Confirm the raw disk size on the NFS backend is unchanged (data intact)
-ls -la /mnt2/virt-linux-prime-033445b9-...-pvc-3527684f-.../disk.img
-# -rw-rw----+ 1 whoopsie bluetooth 107374182400 ... disk.img   (100 GiB, unchanged)
+oc get vmi $NEW -n $NS -o jsonpath='{range .spec.volumes[*]}{.persistentVolumeClaim.claimName}{.dataVolume.name}{"\n"}{end}'
 ```
 
-For our test the result was:
+Verify the data is intact — console into the guest and check a known marker, or
+compare the disk contents/size against the source.
 
-| Check | Result |
-|-------|--------|
-| Old VM `vader.syangsao.net` | deleted (NotFound) |
-| New VM `vader` | Running, Ready=True on `control01.syangsao.net` |
-| VMI volume → PVC | `vol-0 → vader-rename-vm-10001-tmmt5` |
-| PVC | Bound to the **same** PV `pvc-3527684f-...`, 106Gi RWX |
-| PV | phase `Bound`, reclaim `Retain` |
-| Raw disk on NFS | `disk.img` = 107,374,182,400 bytes (unchanged) |
+> **Do not continue past this point until the VM is Running and every volume maps to
+> its clone.** If anything is wrong, delete the new VM (`oc delete vm $NEW -n $NS`) and
+> the clone DataVolumes, fix the problem, and start over — the original VM and its
+> disks are still intact.
 
-The rename is complete and the data disk survived.
+### 6. Swap — delete the original
 
----
-
-## Recovering a stuck Terminating PVC
-
-This section applies when, after deleting the old VM, the PVC goes to `Terminating`
-(set by MTv/forklift plan cleanup) and is stuck behind the `kubernetes.io/pvc-protection` finalizer.
-The PV is already `Retain`, so the **data on the backend is safe** — we only need to get a usable PVC
-back for the renamed VM.
-
-> Prerequisite: confirm no *active* pod still holds the volume (a completed virt-v2v / vddk helper pod
-> is harmless). The PV must be `Retain` and not itself have a deletionTimestamp.
-
-### a. Remove the finalizer so the terminating PVC object is removed
+Only now is anything original destroyed — and **only if the renamed VM was started and
+verified** in step 5. If you deliberately did not start it (`start_after=false`, or the
+source was stopped), the playbook refuses the swap and keeps the original; doing it by
+hand is your own risk:
 
 ```bash
-oc patch pvc <pvc-name> -n $NS --type merge -p '{"metadata":{"finalizers":null}}'
-# persistentvolumeclaim/<pvc-name> patched
+oc delete vm $VM -n $NS
+# Templated DataVolumes and the state PVC are garbage-collected with the VM.
+# Plain PVCs are NOT owned by the VM — release them explicitly:
+oc delete pvc <original-plain-pvc> -n $NS
+# USER-created DataVolumes (referenced via dataVolume volumes, not templates) also
+# survive the VM — release each, which cascades its PVC:
+oc delete dv <original-user-dv> -n $NS
 ```
 
-The PVC object disappears and the PV transitions to `Released` (still `Retain`, no deletionTimestamp):
+The rename is complete. The clone DataVolumes remain in the namespace and **own** the
+live PVCs — leave them alone (deleting one deletes its PVC and the VM's disk).
+
+### Cheat sheet
 
 ```bash
-oc get pvc <pvc-name> -n $NS    # NotFound
-oc get pv <pv-name> -o jsonpath='{.status.phase}{" "}{.spec.persistentVolumeReclaimPolicy}{"\n"}'
-# Released Retain
+NS=virt-linux; VM=vader.syangsao.net; NEW=vader
+virtctl stop $VM -n $NS                              # wait for VMI NotFound
+# for each PVC (incl. hotplug + state PVC):
+#   DataVolume spec.source.pvc=<pvc> storage=<same settings> name=<clone>
+#   oc get dv <clone> -w                               # Succeeded
+oc label pvc persistent-state-for-$NEW -n $NS persistent-state-for=$NEW   # if TPM/EFI
+oc get vm $VM -n $NS -o yaml > ${VM}_${NS}.yaml.bkp
+# transform: NEW_NAME/PVC_MAP/DV_MAP through rename_transform.py (see step 4)
+oc apply -f ${VM}_${NS}.yaml --dry-run=server -n $NS
+oc apply -f ${VM}_${NS}.yaml
+virtctl start $NEW -n $NS                            # verify Running + clone mapping
+# hotplug: virtctl addvolume $NEW -n $NS --volume-name <clone-pvc> [--disk-name <vol>]
+oc delete vm $VM -n $NS
+oc delete pvc <original-plain-pvcs> -n $NS
+oc delete dv <original-user-dvs> -n $NS              # each DV owns its PVC
 ```
 
-### b. Re-create the PVC bound to the same PV
-
-Create a PVC with the **same name** and `spec.volumeName` pointing at the existing PV:
-
-```yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: <pvc-name>          # same name as before
-  namespace: $NS
-spec:
-  accessModes:
-    - ReadWriteMany         # match the original
-  storageClassName: nfs-csi # match the original
-  volumeName: <pv-name>     # the existing PV (Released)
-  resources:
-    requests:
-      storage: 106Gi        # match the original request
-```
+## Usage
 
 ```bash
-oc apply -f pvc-<name>.yaml
-# persistentvolumeclaim/<pvc-name> created
+ansible-playbook rename_vm.yml \
+  -e vm_name=vader.syangsao.net \
+  -e new_name=vader \
+  -e vm_namespace=virt-linux \
+  [-e start_after=auto] \
+  [-e dry_run=false] \
+  [-e keep_old=false]
 ```
 
-The PVC will be `Pending` — Kubernetes does **not** auto-bind a claim to a `Released` PV.
+| Extra var | Default | Meaning |
+|-----------|---------|---------|
+| `vm_name` | — | current VirtualMachine name (required) |
+| `new_name` | — | desired new name (required, must differ, DNS-1123) |
+| `vm_namespace` | — | namespace the VM lives in (required) |
+| `start_after` | `auto` | start the renamed VM iff it was running before (`true`/`false` to force) |
+| `dry_run` | `false` | if `true`: discovery + plan only; nothing is stopped, cloned or applied — and nothing is written to disk |
+| `keep_old` | `false` | if `true`: keep the original VM (stopped) and its PVCs as a rollback window |
+| `swap_unverified` | `false` | if `true`: delete the original even when the renamed VM was never started (boot verification skipped). Default `false` — an unverified swap is refused and the original kept |
+| `clone_wait_retries` × `clone_wait_delay` | 120 × 10s | per-disk clone wait budget (20 min) |
+| `vmi_wait_retries` × `vmi_wait_delay` | 60 × 10s | renamed-VM startup wait budget |
+| `vm_gone_retries` × `vm_gone_delay` | 60 × 5s | old-VM deletion wait budget |
 
-### c. Manually re-bind the PV to the new PVC
+Requirements: `oc` and `virtctl` on `$PATH`, a healthy CDI (part of any CNV
+installation), Python 3 + PyYAML on the Ansible controller, and **namespace-level edit
+access** — nothing cluster-scoped is touched.
 
-Get the new PVC's uid, then patch the PV's `claimRef` to point at it:
+## Failure behavior
 
-```bash
-NEW_UID=$(oc get pvc <pvc-name> -n $NS -o jsonpath='{.metadata.uid}')
-oc patch pv <pv-name> --type merge \
-  -p "{\"spec\":{\"claimRef\":{\"name\":\"<pvc-name>\",\"namespace\":\"$NS\",\"uid\":\"$NEW_UID\"}}}"
-# persistentvolume/<pv-name> patched
-```
+Nothing original is destroyed before the replacement is verified, so every failure has a
+safe posture:
 
-The PV goes back to `Bound` and the PVC becomes `Bound`:
+- **During cloning** (clone stalls or the budget expires): the clone DataVolumes are
+  removed and the original VM is restarted, fully intact. Re-running is just a run —
+  there is deliberately no recovery mode because nothing needs recovering.
+- **At the verification gate** (renamed VM never reaches Running, or a volume maps
+  wrong, or a hotplug re-attach fails): the play fails hard and **the original VM is not
+  deleted**. The new VM and its clones are left in place for investigation; the failure
+  message includes the manual rollback commands (`oc delete vm <new>`, delete the clone
+  DataVolumes, restart the original).
+- **Reporting is honest**: every wait uses `--ignore-not-found` with output-based retry
+  conditions, so a wait can only fail by exhausting its retries — failures can never be
+  reported as success.
+- **A VM that was never started is never swapped**: when boot verification was skipped
+  (`start_after=false` or the source was stopped), the original VM and its disks are
+  kept intact and the play reports the manual finishing steps. Opt into the risk
+  explicitly with `-e swap_unverified=true`.
 
-```bash
-oc get pvc <pvc-name> -n $NS     # Bound  <pv-name>  106Gi  RWX
-oc get pv   <pv-name>            # phase=Bound reclaim=Retain claimRef=$NS/<pvc-name>
-```
+## Costs and operational notes
 
-The data disk is now re-attached to the renamed VM. Continue with step 7 (apply the new VM manifest).
-
----
-
-## Cleanup (optional)
-
-Remove any leftover completed migration helper pods in the namespace:
-
-```bash
-oc get pods -n $NS | grep -E 'Completed' 
-# e.g. vader-rename-vm-10001-wprdz, vddk-validator-vader-renamevzc9p-6qxq9
-oc delete pod <helper-pod> -n $NS
-```
-
----
+- **Full copy per disk.** On clone-capable storage (e.g. ODF/Ceph CSI) CDI uses
+  smart/CSI clones and completes near-instantly; on NFS-CSI it is a host-assisted
+  network copy — plan for the VM to be down for the copy window and for roughly **2× the
+  disk size** in transient storage. CDI host-assisted clones also need scratch space
+  (about the target size for `Filesystem` volumes); a clone stuck in
+  `CloneScheduled`/`ScratchMediated` is a CDI configuration issue, not a playbook issue.
+  The cloned `Filesystem` PVC is provisioned ~6% larger than the source request
+  (CDI filesystem overhead: 1Gi → ~1.06Gi); `Block` volumes are copied exactly.
+- **MTV/Forklift-managed VMs:** if the VMs were migrated with MTV (or are otherwise
+  tracked by a Forklift plan/mapping), update the plan and mapping after the rename —
+  the new DataVolume/PVC names are unknown to MTV, and a later plan cleanup or re-run
+  may target stale objects.
+- **The clone DataVolumes remain and OWN the live PVCs.** Deleting a clone DataVolume
+  deletes its PVC and the VM's disk. This is the same steady state as a
+  `dataVolumeTemplates` VM, but do not "clean up" leftover DVs.
+- **Hotplug detection needs a running VM.** Hotplugged volumes are runtime-only state;
+  when the source VM is stopped they cannot be detected (an unattached hotplug PVC
+  simply survives in the namespace untouched). Note that on recent virtctl,
+  `addvolume` always persists the volume into the VM spec (`--persist` is a deprecated
+  no-op), so volumes hotplugged there are ordinary spec disks, detected by the normal
+  discovery — the runtime-only path matters for older clusters or volumes added through
+  the API without persistence.
+- **Windows guests shut down slowly.** `virtctl stop` sends a graceful ACPI shutdown;
+  Windows can take minutes. If a Windows VM hangs on stop and its launcher pod sticks
+  in `Terminating`, force-delete it to unblock:
+  `oc delete pod virt-launcher-<vm> -n <ns> --grace-period=0 --force`.
 
 ## Files in this repo
 
 | File | Purpose |
 |------|---------|
 | `README.md` | This document. |
-| `rename_vm.yml` | Ansible playbook that automates the whole procedure (including the stuck-PVC recovery). |
-| `rename_transform.py` | Python helper used by the playbook to rename + strip the VM manifest. Standalone-usable. |
-| `vader.syangsao.net_virt-linux.yaml.bkp` | Pristine backup of the original VM manifest (as retrieved from the cluster). |
-| `vader.syangsao.net_virt-linux.yaml` | The **edited** manifest used to create the renamed VM `vader` (new name, new `app` label, server fields stripped). |
+| `rename_vm.yml` | The clone-then-swap rename playbook. |
+| `rename_transform.py` | Python helper used by the playbook to rename the VM manifest, flatten DataVolume references to cloned PVCs and strip server-managed fields. Standalone-usable: `oc get vm $VM -n $NS -o yaml \| NEW_NAME=$NEW_NAME DV_MAP='{...}' PVC_MAP='{...}' python3 rename_transform.py > new.yaml` |
+| `vader.syangsao.net_virt-linux.yaml` / `.bkp` | Example manifest from the original live test of the manual procedure (original repo content). |
+| `windows11.syangsao.net_virt-windows.yaml` / `.bkp` | Example manifest from the original live test of the manual procedure (original repo content). |
 
+## History
 
-## Automating with Ansible
-
-The whole procedure is available as an Ansible playbook: `rename_vm.yml`. It performs steps 0–8 above,
-including the automatic recovery of a stuck Terminating PVC.
-
-```bash
-ansible-playbook rename_vm.yml \
-  -e vm_name=vader.syangsao.net \
-  -e new_name=vader \
-  -e namespace=virt-linux \
-  [-e start_after=true] \
-  [-e dry_run=false]
-```
-
-| Extra var | Default | Meaning |
-|-----------|---------|---------|
-| `vm_name` | — | current VirtualMachine name (required) |
-| `new_name` | — | desired new name (required) |
-| `namespace` | — | namespace the VM lives in (required) |
-| `start_after` | `true` | power the renamed VM back on at the end |
-| `dry_run` | `false` | if `true`: stop + patch PV to Retain only; do **not** delete/apply |
-
-The playbook:
-
-1. reads the live VM, backs up the manifest, and resolves each volume → PVC → PV;
-2. stops the VM and waits for the VMI to be gone;
-3. patches every bound PV to `Retain` (and asserts it);
-4. rewrites the manifest via `rename_transform.py` (rename + strip server fields) and dry-run validates it;
-5. deletes the old VM;
-6. **automatically** detects any PVC stuck in `Terminating`, removes its finalizer, re-creates the PVC
-   bound to the same PV, and manually re-binds the PV's `claimRef`;
-7. applies the renamed manifest, starts the VM, and verifies each volume still maps to its original PVC.
-
-> The transform is a plain Python script (`rename_transform.py`), so you can also use it by hand:
->
-> ```bash
-> oc get vm $VM -n $NS -o yaml | NEW_NAME=$NEW_NAME python3 rename_transform.py > new.yaml
-> ```
-
----
-
-## Quick reference (cheat sheet)
-
-```bash
-NS=virt-linux; VM=vader.syangsao.net; NEW_NAME=vader
-PVC=vader-rename-vm-10001-tmmt5; PV=pvc-3527684f-4517-49da-aa47-7ee2c7687dce
-
-virtctl stop $VM -n $NS
-oc patch pv $PV -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
-oc get vm $VM -n $NS -o yaml > ${VM}_${NS}.yaml.bkp
-cp ${VM}_${NS}.yaml.bkp ${VM}_${NS}.yaml
-# edit ${VM}_${NS}.yaml: name->$NEW_NAME, app label->$NEW_NAME, strip uid/rv/ct/gen/finalizers/status/annotations
-oc apply -f ${VM}_${NS}.yaml --dry-run=client -n $NS
-oc delete vm $VM -n $NS
-# if PVC stuck Terminating: remove finalizer, recreate PVC (volumeName=$PV), patch PV claimRef to new uid
-oc apply -f ${VM}_${NS}.yaml
-virtctl start $NEW_NAME -n $NS
-oc get vmi $NEW_NAME -n $NS   # verify Running + volume -> same PVC
-```
-
----
-
-## Playbook test results (live run on luke)
-
-The playbook was tested end-to-end on the `luke` cluster against a freshly migrated
-`vader.syangsao.net` (namespace `virt-linux`, PVC `copy-of-vader-rename2-vm-10001-6vw5d`,
-PV `pvc-dcb1d431-da22-44b2-8567-147439d33f52`, nfs-csi, 106Gi). Result: **success** — the VM was
-renamed to `vader` and the data disk survived.
-
-| Check | Result |
-|-------|--------|
-| Old VM `vader.syangsao.net` | deleted (NotFound) |
-| New VM `vader` | Running, Ready=True on `control01.syangsao.net` |
-| VMI volume → PVC | `vol-0 → copy-of-vader-rename2-vm-10001-6vw5d` (same PVC) |
-| PVC / PV | Bound to the same PV, reclaim `Retain`, 106Gi |
-| Raw disk on NFS | `disk.img` = 107,374,182,400 bytes (unchanged from baseline) |
-
-### Issues found and fixed during testing
-
-These were real bugs in the first draft of the playbook, all fixed in the committed version:
-
-1. **Playbook structure** — the file was a single mapping; Ansible requires a *list* of plays
-   (`- name:` at the top level). Restructured into one play.
-2. **`query()` filter unavailable** — `from_yaml | query('json_query', ...)` needs community.general;
-   replaced with a plain Jinja attribute expression `(vm_yaml_raw.stdout | from_yaml).spec.template.spec.volumes`.
-3. **`changed_when` referencing bare `stdout`/`result`** — in ansible-core 2.21 these are not resolved
-   inside `changed_when`. Fixed by adding `register:` to each task and referencing the registered var
-   (e.g. `stop_vm.stdout`), or dropping `changed_when` on loop tasks where the command's rc is enough.
-4. **`until:` loops failing on non-zero rc** — wait-for-gone tasks need `failed_when: false` so the
-   `until` condition (rc != 0 = NotFound) controls the outcome instead of the command failure.
-5. **JSON mangled by folded scalars** — `command: >-` strips the double quotes from the `oc patch -p`
-   JSON payload. Switched those to block scalars (`|`) with single-quoted JSON.
-6. **Shell redirection in `command:`** — the transform task uses `<`/`>` which the `command` module does
-   not interpret; switched to `shell:` with `args.executable: /bin/bash`.
-7. **PVC re-create missing `spec.resources`** — a PVC requires `spec.resources.requests.storage`; added it
-   (captured during discovery) so the recovered PVC is valid.
-8. **Final verify jsonpath split by folded scalar** — the `{range ...}` expression contained spaces that
-   `>-` collapsed; switched to a block scalar with single quotes.
-9. **Re-run after partial failure** — added a fallback so "Read the current VM" uses the saved `.bkp`
-   manifest if the source VM is already deleted (makes recovery idempotent).
-
-> Note: on this particular fresh migration the PVC did **not** go stuck-Terminating after the old VM was
-> deleted (the plan cleanup left it Bound), so the recovery branch was skipped and the renamed VM attached
-> directly. The recovery branch was exercised separately during development and is retained for MTv plans
-> that do trigger it.
-
-### Second live run — `windows11.syangsao.net` → `windows11` (virt-windows)
-
-A second end-to-end test was run against a freshly migrated **Windows 11** VM
-(`windows11.syangsao.net`, namespace `virt-windows`, PVC `windows11-rename-vm-45007-jxbkw`,
-PV `pvc-7ba03116-87a5-4901-8d09-dd31b48ed1f2`, nfs-csi, 106Gi). Result: **success** — and this run
-exercised the **stuck-Terminating-PVC recovery branch** for real.
-
-| Check | Result |
-|-------|--------|
-| Old VM `windows11.syangsao.net` | deleted (NotFound) |
-| New VM `windows11` | Running, Ready=True on `control01.syangsao.net`, same IP 192.168.60.55 |
-| VMI volume → PVC | `vol-0 → windows11-rename-vm-45007-jxbkw` (same PVC) |
-| PVC / PV | Bound to the same PV, reclaim `Retain`, 106Gi |
-| Raw disk on NFS | `disk.img` = 107,374,182,400 bytes (unchanged from baseline) |
-
-**What this run added:**
-
-- **Recovery branch proven live.** After the old VM was deleted, MTv plan cleanup set a
-  `deletionTimestamp` on the PVC and it went stuck in `Terminating` behind
-  `kubernetes.io/pvc-protection`. The playbook detected this, removed the finalizer, re-created the PVC
-  bound to the same PV, and manually re-bound the PV's `claimRef` — then applied and started the renamed
-  VM. This is the exact path that previously only had a manual walkthrough.
-- **New bug fixed — "Delete the old VM" not idempotent.** On a re-run after a partial failure the source
-  VM is already gone, so `oc delete vm …` returns rc=1 (NotFound) and failed the play. Added
-  `failed_when: false` to that task.
-- **Windows shutdown is slow / can hang.** `virtctl stop` sends a graceful ACPI shutdown; this Windows 11
-  guest took several minutes and at one point left its launcher pod stuck in `Terminating`, which held the
-  VM's deletion finalizer. The data was safe throughout (PV `Retain`). If a Windows VM ever hangs on stop,
-  force-delete its `virt-launcher-<vm>` pod to unblock: `oc delete pod <launcher> -n <ns> --grace-period=0 --force`.
-- **Cosmetic fix** — a `loop_control label` in "Verify every PV" referenced `item.item.pv` (only valid for the
-  nested-results assert task); corrected to `item.pv` to clear the templating warning.
+The original manual delete-and-recreate procedure, its live-test results (including the
+stuck-Terminating-PVC recovery), and the first automated playbook are preserved in git
+history on the `main` branch The clone-then-swap workflow in this revision supersedes it.
